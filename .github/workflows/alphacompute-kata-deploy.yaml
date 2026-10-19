@@ -1,0 +1,52 @@
+# Publishes ghcr.io/alphacompute/kata-deploy: upstream's kata-deploy image for this branch's base
+# release with kata-static-shim-v2-go.tar.zst rebuilt around the shim from this branch. kata-deploy
+# re-extracts its tarballs into /opt/kata on every start, so the shim has to ship inside the image.
+name: alphacompute kata-deploy
+
+on:
+  push:
+    branches: ["alphacompute/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    env:
+      UPSTREAM_IMAGE: quay.io/kata-containers/kata-deploy@sha256:e677a892072610f948b192d5bedb7fbcc62c894315c22bf703af484c49bd8776
+      GOLANG_IMAGE: docker.io/library/golang@sha256:dd651521feb94cf992bdab3df2fbf3f58e7415f34f02b0ead741f605a8c0f08e
+      IMAGE: ghcr.io/alphacompute/kata-deploy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the shim
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src/src/runtime "$GOLANG_IMAGE" bash -c \
+            "git config --global --add safe.directory /src && make PREFIX=/opt/kata SKIP_GO_VERSION_CHECK=1 containerd-shim-v2 >/dev/null"
+          src/runtime/containerd-shim-kata-v2 --version
+          sha256sum src/runtime/containerd-shim-kata-v2 | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Rebuild the shim tarball
+        run: |
+          mkdir -p work/x
+          c=$(docker create "$UPSTREAM_IMAGE")
+          docker cp "$c:/opt/kata-artifacts/tarballs/kata-static-shim-v2-go.tar.zst" work/orig.tar.zst
+          docker rm "$c" >/dev/null
+          zstd -dc work/orig.tar.zst | sudo tar -x -C work/x --same-owner -p
+          sudo install -m 0755 -o 1001 -g 1001 src/runtime/containerd-shim-kata-v2 work/x/opt/kata/bin/containerd-shim-kata-v2
+          sudo tar -C work/x --sort=name --mtime=2026-07-20T14:30:00Z --numeric-owner -cf - . | zstd -19 -T0 -q -o work/kata-static-shim-v2-go.tar.zst
+          printf 'FROM %s\nCOPY kata-static-shim-v2-go.tar.zst /opt/kata-artifacts/tarballs/kata-static-shim-v2-go.tar.zst\n' "$UPSTREAM_IMAGE" >work/Containerfile
+
+      - name: Build and push
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+          tag="$(cat VERSION)-$(git rev-parse --short=12 HEAD)"
+          docker build -f work/Containerfile \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            --label "org.opencontainers.image.revision=${{ github.sha }}" \
+            -t "$IMAGE:$tag" work
+          docker push "$IMAGE:$tag"
+          echo "$IMAGE:$tag" "$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$tag")" | tee -a "$GITHUB_STEP_SUMMARY"
